@@ -1,4 +1,4 @@
-name: Build macOS pinch-zoom fix
+name: Build macOS trackpad fix
 
 # Rebuilds the editor UI (web-apps) with patches/web-apps/*.patch applied and
 # packages the result with an installer that drops it into ONLYOFFICE.app.
@@ -16,7 +16,7 @@ on:
   push:
     branches: [master]
     paths:
-      - "patches/web-apps/**"
+      - "patches/**"
       - "scripts/install-pinch-fix.sh"
       - ".github/workflows/pinch-zoom-fix.yml"
 
@@ -104,6 +104,9 @@ jobs:
           (cd "$OUT/web-apps" && find . -type f | sort) > "$OUT/FILES"
           echo "::notice title=packaged::$(tr '\n' ' ' < "$OUT/FILES")"
           echo "${{ steps.ref.outputs.version }}" > "$OUT/VERSION"
+          # smooth scrolling: source patches for sdkjs, applied by install.sh to the
+          # app's own sdk-all.js bundles (sdkjs is shipped as plain concatenated JS)
+          cp -R patches/sdkjs "$OUT/sdkjs"
           cp scripts/install-pinch-fix.sh "$OUT/install.sh"
           chmod +x "$OUT/install.sh"
           zip -qr "pinch-zoom-fix-${{ steps.ref.outputs.version }}.zip" "$OUT"

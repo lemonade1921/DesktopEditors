@@ -1,0 +1,13 @@
+diff --git a/pdf/src/viewer.js b/pdf/src/viewer.js
+index fea2230..8a1fa70 100644
+--- a/pdf/src/viewer.js
++++ b/pdf/src/viewer.js
+@@ -779,7 +779,7 @@
+ 		this.timerAnimation = function()
+ 		{
+ 			var now = Date.now();
+-			if (-1 == oThis.RequestAnimationOldTime || (now >= (oThis.RequestAnimationOldTime + 40)) || (now < oThis.RequestAnimationOldTime))
++			if (-1 == oThis.RequestAnimationOldTime || AscCommon.isWheelScrollActive(now) || (now >= (oThis.RequestAnimationOldTime + 40)) || (now < oThis.RequestAnimationOldTime))
+ 			{
+ 				oThis.RequestAnimationOldTime = now;
+ 				oThis.timer();

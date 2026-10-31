@@ -1,0 +1,75 @@
+diff --git a/common/Drawings/WorkEvents.js b/common/Drawings/WorkEvents.js
+index d2ac8e2..9cd222c 100644
+--- a/common/Drawings/WorkEvents.js
++++ b/common/Drawings/WorkEvents.js
+@@ -842,10 +842,20 @@
+ 		this.id = null;
+ 	};
+ 
++	// Returns true while the user is wheel/trackpad scrolling (incl. momentum).
++	// Paint loops repaint every animation frame during that time instead of every
++	// 40ms, otherwise scrolling is capped at 25 fps and judders against the
++	// display refresh (60/120 Hz).
++	function isWheelScrollActive(now)
++	{
++		return (now - g_lastWheelScrollTime) < 300;
++	}
++	var g_lastWheelScrollTime = 0;
++
+ 	PaintMessageLoop.prototype._animation = function()
+ 	{
+ 		var now = Date.now();
+-		if (!this.isUseInterval || -1 === this.requestAnimationOldTime || (now >= (this.requestAnimationOldTime + this.interval)) || (now < this.requestAnimationOldTime))
++		if (!this.isUseInterval || isWheelScrollActive(now) || -1 === this.requestAnimationOldTime || (now >= (this.requestAnimationOldTime + this.interval)) || (now < this.requestAnimationOldTime))
+ 		{
+ 			this.requestAnimationOldTime = now;
+ 			this.engine();
+@@ -903,6 +913,23 @@
+ 		return isSupport;
+ 	}
+ 
++	var g_wheelRemainder = {
++		x : 0, y : 0, time : 0,
++		take : function(axis, value, now)
++		{
++			// start fresh after a pause or when the direction changes
++			if (now - this.time > 200 || (value !== 0 && this[axis] !== 0 && (value > 0) !== (this[axis] > 0)))
++				this[axis] = 0;
++			if (axis === "y")
++				this.time = now;
++
++			var total = value + this[axis];
++			var whole = total < 0 ? Math.ceil(total) : Math.floor(total);
++			this[axis] = total - whole;
++			return whole;
++		}
++	};
++
+ 	function checkMouseWhell(e, options)
+ 	{
+ 		let isSupportBidirectional = false;
+@@ -955,8 +982,14 @@
+ 			}
+ 		}
+ 
+-		deltaX >>= 0;
+-		deltaY >>= 0;
++		g_lastWheelScrollTime = Date.now();
++
++		// Trackpads send many small deltas. Truncating each one to an integer
++		// dropped most of a slow scroll and the tail of momentum scrolling, which
++		// made scrolling stutter and stop abruptly. Carry the fractions over to
++		// the next event instead, so the sum of the returned steps matches the input.
++		deltaX = g_wheelRemainder.take("x", deltaX, g_lastWheelScrollTime);
++		deltaY = g_wheelRemainder.take("y", deltaY, g_lastWheelScrollTime);
+ 
+ 		if (!isSupportBidirectional)
+ 		{
+@@ -994,6 +1027,7 @@
+ 	window['AscCommon'].global_mouseEvent        = global_mouseEvent;
+ 	window['AscCommon'].global_keyboardEvent     = global_keyboardEvent;
+ 	window['AscCommon'].check_KeyboardEvent      = check_KeyboardEvent;
++	window['AscCommon'].isWheelScrollActive      = isWheelScrollActive;
+ 	window['AscCommon'].check_KeyboardEvent2     = check_KeyboardEvent2;
+ 	window['AscCommon'].check_MouseMoveEvent     = check_MouseMoveEvent;
+ 	window['AscCommon'].CreateMouseUpEventObject = CreateMouseUpEventObject;
