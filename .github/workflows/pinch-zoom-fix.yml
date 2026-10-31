@@ -24,7 +24,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Resolve web-apps version
         id: ref
@@ -62,9 +62,9 @@ jobs:
             git apply --verbose "$p"
           done
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Install build tools
         working-directory: web-apps/build
@@ -88,15 +88,18 @@ jobs:
           mkdir -p "$OUT/web-apps/apps"
           for ed in documenteditor spreadsheeteditor presentationeditor pdfeditor visioeditor; do
             cp -R "web-apps/deploy/web-apps/apps/$ed" "$OUT/web-apps/apps/$ed"
-            grep -q "SmoothWheelZoom" "$OUT/web-apps/apps/$ed/main/app.js" \
-              || { echo "::error::fix missing from $ed bundle"; exit 1; }
+            HITS=$(grep -rl "SmoothWheelZoom" "$OUT/web-apps/apps/$ed/main" --include=*.js | sed "s|$OUT/web-apps/apps/||" | tr '\n' ' ')
+            if [ -z "$HITS" ]; then
+              echo "::error::fix missing from $ed bundle; files: $(cd $OUT/web-apps/apps/$ed/main && ls | tr '\n' ' ')"; exit 1
+            fi
+            echo "::notice::$ed fix found in: $HITS"
           done
           echo "${{ steps.ref.outputs.version }}" > "$OUT/VERSION"
           cp scripts/install-pinch-fix.sh "$OUT/install.sh"
           chmod +x "$OUT/install.sh"
           zip -qr "pinch-zoom-fix-${{ steps.ref.outputs.version }}.zip" "$OUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: pinch-zoom-fix-${{ steps.ref.outputs.version }}
           path: pinch-zoom-fix-${{ steps.ref.outputs.version }}.zip
