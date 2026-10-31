@@ -1,4 +1,4 @@
-From 9f2049a37290c77df96b9e8c111c9b8525cbf3a3 Mon Sep 17 00:00:00 2001
+From d609de89cf36427b176e2223796bdf8363318f10 Mon Sep 17 00:00:00 2001
 From: lemonade1921 <joandegenover1@gmail.com>
 Date: Sat, 31 Oct 2026 02:33:26 +0100
 Subject: [PATCH] Smooth trackpad pinch-to-zoom on macOS
@@ -7,25 +7,27 @@ On macOS a trackpad pinch arrives as a burst of ctrl+wheel events with small
 fractional deltas. Each event was mapped to a full zoomIn()/zoomOut() step and
 a full re-render, so pinching jumped through zoom levels and stuttered.
 
-Add Common.Utils.SmoothWheelZoom, which converts wheel deltas into a
-continuous zoom factor (e^(-deltaY/100), matching Chromium's pinch scale),
-accumulates them and applies at most one zoom per frame (~33 fps). Used by the
+Add Common.Utils.SmoothWheelZoom: while the fingers move, the already drawn
+document canvases are scaled with a CSS transform (GPU only, every frame,
+e^(-deltaY/100) like Chromium's pinch scale). When the gesture pauses the real
+zoom is applied once, and the preview transform is dropped in the same task the
+editor repaints its main canvas, so there's no flash or jump. Used by the
 document, spreadsheet, presentation, PDF and diagram editors for pixel-precise
 wheel input on macOS; line/page-mode mouse wheels keep the stepped zoom.
 ---
- apps/common/main/lib/util/utils.js            | 103 ++++++++++++++++++
+ apps/common/main/lib/util/utils.js            | 226 ++++++++++++++++++
  .../main/app/controller/DocumentHolder.js     |   7 +-
  .../main/app/controller/DocumentHolder.js     |   6 +-
  .../main/app/controller/DocumentHolder.js     |   7 +-
- .../main/app/controller/DocumentHolder.js     |  15 ++-
+ .../main/app/controller/DocumentHolder.js     |  19 +-
  .../main/app/controller/DocumentHolder.js     |   6 +-
- 6 files changed, 139 insertions(+), 5 deletions(-)
+ 6 files changed, 266 insertions(+), 5 deletions(-)
 
 diff --git a/apps/common/main/lib/util/utils.js b/apps/common/main/lib/util/utils.js
-index b322d9c4..634a065b 100644
+index b322d9c4..8fbb975d 100644
 --- a/apps/common/main/lib/util/utils.js
 +++ b/apps/common/main/lib/util/utils.js
-@@ -1669,4 +1669,107 @@ define([], function () {
+@@ -1669,4 +1669,230 @@ define([], function () {
  
          return (typeof val === 'number') ||  !(val === '' || !regstr.test(val.trim()) || isNaN(parseFloat(val)));
      };
@@ -34,25 +36,36 @@ index b322d9c4..634a065b 100644
 +     * Smooth ctrl+wheel / trackpad-pinch zoom.
 +     *
 +     * On macOS a trackpad pinch reaches the page as a burst of `wheel` events with
-+     * ctrlKey set and small fractional deltaY values (dozens per second). The editors
-+     * used to map every one of those events to a full zoomIn()/zoomOut() step
-+     * (+-10% or more) and a full document re-render, so a gentle pinch jumped
-+     * through several zoom levels and the UI stuttered.
++     * ctrlKey set and small fractional deltaY values (60+ per second). The editors
++     * mapped every event to a full zoomIn()/zoomOut() step plus a full document
++     * re-render, so pinching jumped between zoom levels and stuttered.
 +     *
-+     * This helper turns the deltas into a continuous zoom factor, accumulates them
-+     * and applies at most one zoom per animation frame.
++     * Re-rendering a document is far too slow to do on every frame, so this works
++     * the way browsers and native viewers do:
++     *   1. while the fingers move, the canvases that are already drawn are scaled
++     *      with a CSS transform (GPU only, follows the fingers every frame);
++     *   2. when the gesture pauses, the real zoom is applied once, and the preview
++     *      transform is dropped in the same frame the editor redraws, so there is
++     *      no flash or jump between the preview and the sharp result.
 +     *
 +     * options:
 +     *   getZoom()        -> current zoom in percent
 +     *   setZoom(percent) -> apply zoom in percent
 +     *   min, max         -> zoom limits in percent
++     *   getView()        -> { el: element whose children are the document canvases,
++     *                         origin: 'center' | 'topleft' }  (where the editor
++     *                         keeps the document fixed when it zooms)
 +     */
 +    Common.Utils.SmoothWheelZoom = function (options) {
 +        this.options = options || {};
-+        this._target = null;
++        this._target = null;     // zoom the fingers are asking for
++        this._shown = null;      // zoom of what's currently drawn on the canvases
++        this._pending = null;    // zoom applied to the editor, waiting for its redraw
++        this._view = null;
 +        this._raf = null;
-+        this._lastApply = 0;
 +        this._idleTimer = null;
++        this._fallbackTimer = null;
++        this._hooks = [];
 +    };
 +
 +    // For the document/presentation/pdf/visio APIs: zoom is set with api.zoom(percent)
@@ -66,15 +79,19 @@ index b322d9c4..634a065b 100644
 +            getZoom: function () { return current; },
 +            setZoom: function (percent) { api.zoom(percent); },
 +            min: min,
-+            max: max
++            max: max,
++            getView: function () {
++                var c = document.getElementById('id_viewer');
++                return c && c.parentElement ? { el: c.parentElement, origin: 'center' } : null;
++            }
 +        });
 +    };
 +
 +    Common.Utils.SmoothWheelZoom.prototype = {
-+        SENSITIVITY: 0.01,       // zoom factor per pixel of deltaY: e^(-deltaY * k)
-+        MAX_EVENT_DELTA: 30,     // clamp per-event delta so a mouse notch isn't a huge jump
-+        MIN_FRAME_INTERVAL: 30,  // ms between re-renders (~33 fps), zooming is expensive
-+        IDLE_RESET: 250,         // ms after the gesture ends before re-reading zoom from the editor
++        SENSITIVITY: 0.01,      // zoom factor per pixel of deltaY: e^(-deltaY/100), Chromium's pinch scale
++        MAX_EVENT_DELTA: 30,    // clamp per-event delta so a mouse notch isn't a huge jump
++        COMMIT_DELAY: 160,      // ms without pinch events before the real zoom is applied
++        REDRAW_TIMEOUT: 400,    // ms to wait for the editor's redraw before dropping the preview anyway
 +
 +        // Use the smooth path only for pixel-precise wheel input on macOS (trackpads, Magic Mouse).
 +        canHandle: function (event) {
@@ -93,43 +110,151 @@ index b322d9c4..634a065b 100644
 +                var cur = this.options.getZoom();
 +                if (!(cur > 0)) return;
 +                this._target = cur;
++                if (this._shown === null) this._shown = cur;
 +            }
 +
 +            this._target *= Math.exp(-dy * this.SENSITIVITY);
 +            this._target = Math.max(this.options.min, Math.min(this.options.max, this._target));
 +
-+            this._schedule();
++            this._schedulePreview();
 +
 +            var me = this;
 +            clearTimeout(this._idleTimer);
-+            this._idleTimer = setTimeout(function () {
-+                me._flush();
-+                me._target = null;
-+            }, this.IDLE_RESET);
++            this._idleTimer = setTimeout(function () { me._commit(); }, this.COMMIT_DELAY);
 +        },
 +
-+        _schedule: function () {
++        // ---- live preview -------------------------------------------------------
++
++        _schedulePreview: function () {
 +            if (this._raf !== null) return;
 +            var me = this,
 +                raf = window.requestAnimationFrame || function (cb) { return setTimeout(cb, 16); };
 +            this._raf = raf(function () {
 +                me._raf = null;
-+                var now = Date.now();
-+                if (now - me._lastApply < me.MIN_FRAME_INTERVAL) {
-+                    me._schedule();
-+                    return;
-+                }
-+                me._flush();
++                me._applyPreview();
 +            });
 +        },
 +
-+        _flush: function () {
-+            if (this._target === null) return;
-+            var value = Math.round(this._target);
-+            if (value !== Math.round(this.options.getZoom())) {
-+                this._lastApply = Date.now();
-+                this.options.setZoom(value);
++        _getView: function () {
++            if (this._view && document.body.contains(this._view.el)) return this._view;
++            this._view = this.options.getView ? this.options.getView() : null;
++            return this._view;
++        },
++
++        _applyPreview: function () {
++            var view = this._getView();
++            if (!view || this._target === null || !(this._shown > 0)) return;
++
++            var scale = this._target / this._shown;
++            if (Math.abs(scale - 1) < 0.001) { this._clearPreview(); return; }
++
++            var el = view.el,
++                ox = view.origin === 'topleft' ? 0 : el.clientWidth / 2,
++                oy = view.origin === 'topleft' ? 0 : el.clientHeight / 2;
++
++            if (!this._saved) {
++                this._saved = { overflow: el.style.overflow };
++                el.style.overflow = 'hidden';
 +            }
++            for (var i = 0; i < el.children.length; i++) {
++                var c = el.children[i];
++                if (c._swzSaved === undefined)
++                    c._swzSaved = { t: c.style.transform, o: c.style.transformOrigin, w: c.style.willChange };
++                // each child is positioned inside the view, so express the shared origin in its own coordinates
++                c.style.willChange = 'transform';
++                c.style.transformOrigin = (ox - c.offsetLeft) + 'px ' + (oy - c.offsetTop) + 'px';
++                c.style.transform = 'scale(' + scale + ')';
++            }
++        },
++
++        _clearPreview: function () {
++            var view = this._view;
++            if (!view || !this._saved) return;
++            var el = view.el;
++            for (var i = 0; i < el.children.length; i++) {
++                var c = el.children[i];
++                if (c._swzSaved !== undefined) {
++                    c.style.transform = c._swzSaved.t;
++                    c.style.transformOrigin = c._swzSaved.o;
++                    c.style.willChange = c._swzSaved.w;
++                    delete c._swzSaved;
++                }
++            }
++            el.style.overflow = this._saved.overflow;
++            this._saved = null;
++        },
++
++        // ---- real zoom ----------------------------------------------------------
++
++        _commit: function () {
++            if (this._target === null) return;
++            var value = Math.round(this._target),
++                cur = this.options.getZoom();
++            this._target = null;
++
++            if (value === Math.round(cur)) {
++                this._shown = null;
++                this._clearPreview();
++                return;
++            }
++
++            var me = this;
++            this._pending = value;
++            // The editor draws on its own paint loop. Watch the canvases and swap the
++            // preview for the real render in the same task that draws it.
++            this._hookRedraw(function () { me._onRedraw(); });
++            clearTimeout(this._fallbackTimer);
++            this._fallbackTimer = setTimeout(function () { me._onRedraw(); }, this.REDRAW_TIMEOUT);
++
++            this.options.setZoom(value);
++        },
++
++        _onRedraw: function () {
++            if (this._pending === null) return;
++            this._unhookRedraw();
++            clearTimeout(this._fallbackTimer);
++            this._pending = null;
++            var actual = this.options.getZoom();     // the editor may have clamped the value
++
++            if (this._target !== null) {
++                // fingers are still moving: keep previewing, relative to the new render
++                this._shown = actual;
++                this._applyPreview();
++            } else {
++                this._shown = null;
++                this._clearPreview();
++            }
++        },
++
++        _hookRedraw: function (cb) {
++            this._unhookRedraw();
++            var view = this._getView();
++            if (!view) return;
++            // Watch only the main (largest) canvas: overlays repaint on their own
++            // (selection, cursor) and would end the preview too early.
++            var canvases = view.el.getElementsByTagName('canvas'),
++                main = null, area = 0;
++            for (var i = 0; i < canvases.length; i++) {
++                var a = canvases[i].width * canvases[i].height;
++                if (a > area) { area = a; main = canvases[i]; }
++            }
++            var ctx = main ? main.getContext('2d') : null;
++            if (!ctx) return;
++            var me = this,
++                fired = false,
++                fire = function () { if (!fired) { fired = true; cb(); } };
++            ['drawImage', 'fillRect', 'clearRect', 'putImageData'].forEach(function (name) {
++                if (Object.prototype.hasOwnProperty.call(ctx, name)) return;
++                var orig = ctx[name];
++                ctx[name] = function () { fire(); return orig.apply(this, arguments); };
++                me._hooks.push({ ctx: ctx, name: name });
++            });
++        },
++
++        _unhookRedraw: function () {
++            for (var i = 0; i < this._hooks.length; i++)
++                delete this._hooks[i].ctx[this._hooks[i].name];
++            this._hooks = [];
 +        }
 +    };
  });
@@ -209,10 +334,10 @@ index af20c18f..a046bc1e 100644
                      me._handleZoomWheel = true;
                  } else if (delta > 0) {
 diff --git a/apps/spreadsheeteditor/main/app/controller/DocumentHolder.js b/apps/spreadsheeteditor/main/app/controller/DocumentHolder.js
-index ab8b9bb0..a353925c 100644
+index ab8b9bb0..3c506d34 100644
 --- a/apps/spreadsheeteditor/main/app/controller/DocumentHolder.js
 +++ b/apps/spreadsheeteditor/main/app/controller/DocumentHolder.js
-@@ -346,7 +346,20 @@ define([
+@@ -346,7 +346,24 @@ define([
  
                  if (e.ctrlKey && !e.altKey) {
                      var factor = this.api.asc_getZoom();
@@ -223,7 +348,11 @@ index ab8b9bb0..a353925c 100644
 +                            getZoom: function () { return api.asc_getZoom() * 100; },
 +                            setZoom: function (percent) { api.asc_setZoom(percent / 100); },
 +                            min: 10,
-+                            max: 500
++                            max: 500,
++                            getView: function () {
++                                var el = document.getElementById('ws-canvas-outer');
++                                return el ? { el: el, origin: 'topleft' } : null;
++                            }
 +                        });
 +                    }
 +                    if (this._smoothWheelZoom.canHandle(e)) {
