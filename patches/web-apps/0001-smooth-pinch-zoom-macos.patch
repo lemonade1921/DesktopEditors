@@ -1,0 +1,263 @@
+From 9f2049a37290c77df96b9e8c111c9b8525cbf3a3 Mon Sep 17 00:00:00 2001
+From: lemonade1921 <joandegenover1@gmail.com>
+Date: Sat, 31 Oct 2026 02:33:26 +0100
+Subject: [PATCH] Smooth trackpad pinch-to-zoom on macOS
+
+On macOS a trackpad pinch arrives as a burst of ctrl+wheel events with small
+fractional deltas. Each event was mapped to a full zoomIn()/zoomOut() step and
+a full re-render, so pinching jumped through zoom levels and stuttered.
+
+Add Common.Utils.SmoothWheelZoom, which converts wheel deltas into a
+continuous zoom factor (e^(-deltaY/100), matching Chromium's pinch scale),
+accumulates them and applies at most one zoom per frame (~33 fps). Used by the
+document, spreadsheet, presentation, PDF and diagram editors for pixel-precise
+wheel input on macOS; line/page-mode mouse wheels keep the stepped zoom.
+---
+ apps/common/main/lib/util/utils.js            | 103 ++++++++++++++++++
+ .../main/app/controller/DocumentHolder.js     |   7 +-
+ .../main/app/controller/DocumentHolder.js     |   6 +-
+ .../main/app/controller/DocumentHolder.js     |   7 +-
+ .../main/app/controller/DocumentHolder.js     |  15 ++-
+ .../main/app/controller/DocumentHolder.js     |   6 +-
+ 6 files changed, 139 insertions(+), 5 deletions(-)
+
+diff --git a/apps/common/main/lib/util/utils.js b/apps/common/main/lib/util/utils.js
+index b322d9c4..634a065b 100644
+--- a/apps/common/main/lib/util/utils.js
++++ b/apps/common/main/lib/util/utils.js
+@@ -1669,4 +1669,107 @@ define([], function () {
+ 
+         return (typeof val === 'number') ||  !(val === '' || !regstr.test(val.trim()) || isNaN(parseFloat(val)));
+     };
++
++    /*
++     * Smooth ctrl+wheel / trackpad-pinch zoom.
++     *
++     * On macOS a trackpad pinch reaches the page as a burst of `wheel` events with
++     * ctrlKey set and small fractional deltaY values (dozens per second). The editors
++     * used to map every one of those events to a full zoomIn()/zoomOut() step
++     * (+-10% or more) and a full document re-render, so a gentle pinch jumped
++     * through several zoom levels and the UI stuttered.
++     *
++     * This helper turns the deltas into a continuous zoom factor, accumulates them
++     * and applies at most one zoom per animation frame.
++     *
++     * options:
++     *   getZoom()        -> current zoom in percent
++     *   setZoom(percent) -> apply zoom in percent
++     *   min, max         -> zoom limits in percent
++     */
++    Common.Utils.SmoothWheelZoom = function (options) {
++        this.options = options || {};
++        this._target = null;
++        this._raf = null;
++        this._lastApply = 0;
++        this._idleTimer = null;
++    };
++
++    // For the document/presentation/pdf/visio APIs: zoom is set with api.zoom(percent)
++    // and reported through 'asc_onZoomChange'. Call from the controller's setApi().
++    Common.Utils.SmoothWheelZoom.attachToDocApi = function (api, min, max) {
++        var current = 100;
++        api.asc_registerCallback('asc_onZoomChange', function (percent) {
++            if (percent > 0) current = percent;
++        });
++        return new Common.Utils.SmoothWheelZoom({
++            getZoom: function () { return current; },
++            setZoom: function (percent) { api.zoom(percent); },
++            min: min,
++            max: max
++        });
++    };
++
++    Common.Utils.SmoothWheelZoom.prototype = {
++        SENSITIVITY: 0.01,       // zoom factor per pixel of deltaY: e^(-deltaY * k)
++        MAX_EVENT_DELTA: 30,     // clamp per-event delta so a mouse notch isn't a huge jump
++        MIN_FRAME_INTERVAL: 30,  // ms between re-renders (~33 fps), zooming is expensive
++        IDLE_RESET: 250,         // ms after the gesture ends before re-reading zoom from the editor
++
++        // Use the smooth path only for pixel-precise wheel input on macOS (trackpads, Magic Mouse).
++        canHandle: function (event) {
++            var e = event && event.originalEvent ? event.originalEvent : event;
++            return !!(Common.Utils.isMac && e && typeof e.deltaY === 'number' && !e.deltaMode);
++        },
++
++        handle: function (event) {
++            var e = event.originalEvent ? event.originalEvent : event,
++                dy = e.deltaY;
++            if (!dy) return;
++
++            dy = Math.max(-this.MAX_EVENT_DELTA, Math.min(this.MAX_EVENT_DELTA, dy));
++
++            if (this._target === null) {
++                var cur = this.options.getZoom();
++                if (!(cur > 0)) return;
++                this._target = cur;
++            }
++
++            this._target *= Math.exp(-dy * this.SENSITIVITY);
++            this._target = Math.max(this.options.min, Math.min(this.options.max, this._target));
++
++            this._schedule();
++
++            var me = this;
++            clearTimeout(this._idleTimer);
++            this._idleTimer = setTimeout(function () {
++                me._flush();
++                me._target = null;
++            }, this.IDLE_RESET);
++        },
++
++        _schedule: function () {
++            if (this._raf !== null) return;
++            var me = this,
++                raf = window.requestAnimationFrame || function (cb) { return setTimeout(cb, 16); };
++            this._raf = raf(function () {
++                me._raf = null;
++                var now = Date.now();
++                if (now - me._lastApply < me.MIN_FRAME_INTERVAL) {
++                    me._schedule();
++                    return;
++                }
++                me._flush();
++            });
++        },
++
++        _flush: function () {
++            if (this._target === null) return;
++            var value = Math.round(this._target);
++            if (value !== Math.round(this.options.getZoom())) {
++                this._lastApply = Date.now();
++                this.options.setZoom(value);
++            }
++        }
++    };
+ });
+\ No newline at end of file
+diff --git a/apps/documenteditor/main/app/controller/DocumentHolder.js b/apps/documenteditor/main/app/controller/DocumentHolder.js
+index 2e1031f8..17ddca54 100644
+--- a/apps/documenteditor/main/app/controller/DocumentHolder.js
++++ b/apps/documenteditor/main/app/controller/DocumentHolder.js
+@@ -192,6 +192,7 @@ define([
+ 
+         setApi: function(o) {
+             this.api = o;
++            this._smoothWheelZoom = this.api ? Common.Utils.SmoothWheelZoom.attachToDocApi(this.api, 50, 500) : null;
+             if (this.api) {
+                 if (this.mode.isEdit === true) {
+                     this.api.asc_registerCallback('asc_onLockDocumentProps',        _.bind(this.onApiLockDocumentProps, this));
+@@ -390,7 +391,11 @@ define([
+             }
+ 
+             if (me._ctrlPressedAtScrollStart && !event.altKey) {
+-                if (delta < 0) {
++                if (me._smoothWheelZoom && me._smoothWheelZoom.canHandle(event)) {
++                    // macOS trackpad pinch / precise scrolling: continuous, frame-throttled zoom
++                    me._smoothWheelZoom.handle(event);
++                    me._handleZoomWheel = true;
++                } else if (delta < 0) {
+                     me.api.zoomOut();
+                     me._handleZoomWheel = true;
+                 } else if (delta > 0) {
+diff --git a/apps/pdfeditor/main/app/controller/DocumentHolder.js b/apps/pdfeditor/main/app/controller/DocumentHolder.js
+index ecb2e275..f8d3a16e 100644
+--- a/apps/pdfeditor/main/app/controller/DocumentHolder.js
++++ b/apps/pdfeditor/main/app/controller/DocumentHolder.js
+@@ -165,6 +165,7 @@ define([
+ 
+         setApi: function(o) {
+             this.api = o;
++            this._smoothWheelZoom = this.api ? Common.Utils.SmoothWheelZoom.attachToDocApi(this.api, 50, 500) : null;
+             if (this.api) {
+                 (this.mode.isEdit === true) && this.api.asc_registerCallback('asc_onCountPages',                   _.bind(this.onCountPages, this));
+                 this.documentHolder.setApi(this.api);
+@@ -354,7 +355,10 @@ define([
+             }
+ 
+             if (me._ctrlPressedAtScrollStart && !event.altKey) {
+-                if (delta < 0) {
++                if (me._smoothWheelZoom && me._smoothWheelZoom.canHandle(event)) {
++                    // macOS trackpad pinch / precise scrolling: continuous, frame-throttled zoom
++                    me._smoothWheelZoom.handle(event);
++                } else if (delta < 0) {
+                     me.api.zoomOut();
+                 } else if (delta > 0) {
+                     me.api.zoomIn();
+diff --git a/apps/presentationeditor/main/app/controller/DocumentHolder.js b/apps/presentationeditor/main/app/controller/DocumentHolder.js
+index af20c18f..a046bc1e 100644
+--- a/apps/presentationeditor/main/app/controller/DocumentHolder.js
++++ b/apps/presentationeditor/main/app/controller/DocumentHolder.js
+@@ -196,6 +196,7 @@ define([
+ 
+         setApi: function(api) {
+             this.api = api;
++            this._smoothWheelZoom = this.api ? Common.Utils.SmoothWheelZoom.attachToDocApi(this.api, 50, 500) : null;
+ 
+             var me = this;
+             if (me.api) {
+@@ -466,7 +467,11 @@ define([
+             }
+ 
+             if (me._ctrlPressedAtScrollStart && !event.altKey) {
+-                if (delta < 0) {
++                if (me._smoothWheelZoom && me._smoothWheelZoom.canHandle(event)) {
++                    // macOS trackpad pinch / precise scrolling: continuous, frame-throttled zoom
++                    me._smoothWheelZoom.handle(event);
++                    me._handleZoomWheel = true;
++                } else if (delta < 0) {
+                     me.api.zoomOut();
+                     me._handleZoomWheel = true;
+                 } else if (delta > 0) {
+diff --git a/apps/spreadsheeteditor/main/app/controller/DocumentHolder.js b/apps/spreadsheeteditor/main/app/controller/DocumentHolder.js
+index ab8b9bb0..a353925c 100644
+--- a/apps/spreadsheeteditor/main/app/controller/DocumentHolder.js
++++ b/apps/spreadsheeteditor/main/app/controller/DocumentHolder.js
+@@ -346,7 +346,20 @@ define([
+ 
+                 if (e.ctrlKey && !e.altKey) {
+                     var factor = this.api.asc_getZoom();
+-                    if (delta < 0) {
++                    if (!this._smoothWheelZoom || this._smoothWheelZoomApi !== this.api) {
++                        var api = this._smoothWheelZoomApi = this.api;
++                        this._smoothWheelZoom = new Common.Utils.SmoothWheelZoom({
++                            getZoom: function () { return api.asc_getZoom() * 100; },
++                            setZoom: function (percent) { api.asc_setZoom(percent / 100); },
++                            min: 10,
++                            max: 500
++                        });
++                    }
++                    if (this._smoothWheelZoom.canHandle(e)) {
++                        // macOS trackpad pinch / precise scrolling: continuous, frame-throttled zoom
++                        this._smoothWheelZoom.handle(e);
++                        this._handleZoomWheel = true;
++                    } else if (delta < 0) {
+                         factor = Math.ceil(factor * 10)/10;
+                         factor -= 0.1;
+                         if (!(factor < .1)) {
+diff --git a/apps/visioeditor/main/app/controller/DocumentHolder.js b/apps/visioeditor/main/app/controller/DocumentHolder.js
+index 08be58ac..6faa8f67 100644
+--- a/apps/visioeditor/main/app/controller/DocumentHolder.js
++++ b/apps/visioeditor/main/app/controller/DocumentHolder.js
+@@ -111,6 +111,7 @@ define([
+ 
+         setApi: function(o) {
+             this.api = o;
++            this._smoothWheelZoom = this.api ? Common.Utils.SmoothWheelZoom.attachToDocApi(this.api, 10, 500) : null;
+ 
+             if (this.api) {
+                 this.api.asc_registerCallback('asc_onContextMenu',                  _.bind(this.onContextMenu, this));
+@@ -289,7 +290,10 @@ define([
+             }
+ 
+             if (me._ctrlPressedAtScrollStart && !event.altKey) {
+-                if (delta < 0) {
++                if (me._smoothWheelZoom && me._smoothWheelZoom.canHandle(event)) {
++                    // macOS trackpad pinch / precise scrolling: continuous, frame-throttled zoom
++                    me._smoothWheelZoom.handle(event);
++                } else if (delta < 0) {
+                     me.api.zoomOut();
+                 } else if (delta > 0) {
+                     me.api.zoomIn();
+-- 
+2.43.0
+

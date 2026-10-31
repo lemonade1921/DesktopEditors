@@ -1,0 +1,102 @@
+name: Build macOS pinch-zoom fix
+
+# Rebuilds the editor UI (web-apps) with patches/web-apps/*.patch applied and
+# packages the result with an installer that drops it into ONLYOFFICE.app.
+#
+# Run it from the Actions tab with your installed ONLYOFFICE version
+# (ONLYOFFICE > About), e.g. "9.5.0". The rebuilt files must match that version.
+
+on:
+  workflow_dispatch:
+    inputs:
+      onlyoffice_version:
+        description: "Installed ONLYOFFICE version, e.g. 9.5.0 (empty = web-apps commit pinned in this repo)"
+        required: false
+        default: ""
+  push:
+    branches: [master]
+    paths:
+      - "patches/web-apps/**"
+      - "scripts/install-pinch-fix.sh"
+      - ".github/workflows/pinch-zoom-fix.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve web-apps version
+        id: ref
+        run: |
+          V="${{ inputs.onlyoffice_version }}"
+          if [ -n "$V" ]; then
+            TAG=$(git ls-remote --tags --refs https://github.com/ONLYOFFICE/web-apps "refs/tags/v$V.*" \
+                  | awk -F/ '{print $3}' | sort -V | tail -1)
+            if [ -z "$TAG" ]; then echo "::error::No ONLYOFFICE/web-apps tag found for version $V"; exit 1; fi
+            echo "ref=$TAG" >> "$GITHUB_OUTPUT"
+            echo "version=$V" >> "$GITHUB_OUTPUT"
+            echo "build=${TAG##*.}" >> "$GITHUB_OUTPUT"
+          else
+            SHA=$(git ls-tree HEAD web-apps | awk '{print $3}')
+            V=$(grep -m1 -oE '^## [0-9]+\.[0-9]+\.[0-9]+' CHANGELOG.md | cut -c4-)
+            echo "ref=$SHA" >> "$GITHUB_OUTPUT"
+            echo "version=$V" >> "$GITHUB_OUTPUT"
+            echo "build=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch web-apps source
+        run: |
+          git init -q web-apps
+          cd web-apps
+          git remote add origin https://github.com/ONLYOFFICE/web-apps.git
+          git fetch -q --depth 1 origin "${{ steps.ref.outputs.ref }}"
+          git checkout -q FETCH_HEAD
+          echo "web-apps at $(git rev-parse HEAD) (${{ steps.ref.outputs.ref }})"
+
+      - name: Apply patches
+        run: |
+          cd web-apps
+          for p in ../patches/web-apps/*.patch; do
+            echo "Applying $p"
+            git apply --verbose "$p"
+          done
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install build tools
+        working-directory: web-apps/build
+        run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+
+      - name: Build editors
+        working-directory: web-apps/build
+        env:
+          PRODUCT_VERSION: ${{ steps.ref.outputs.version }}
+          BUILD_NUMBER: ${{ steps.ref.outputs.build }}
+        run: |
+          for ed in documenteditor spreadsheeteditor presentationeditor pdfeditor visioeditor; do
+            echo "::group::$ed"
+            npx grunt "init-build-$ed" deploy-app-main
+            echo "::endgroup::"
+          done
+
+      - name: Package
+        run: |
+          OUT=pinch-zoom-fix
+          mkdir -p "$OUT/web-apps/apps"
+          for ed in documenteditor spreadsheeteditor presentationeditor pdfeditor visioeditor; do
+            cp -R "web-apps/deploy/web-apps/apps/$ed" "$OUT/web-apps/apps/$ed"
+            grep -q "SmoothWheelZoom" "$OUT/web-apps/apps/$ed/main/app.js" \
+              || { echo "::error::fix missing from $ed bundle"; exit 1; }
+          done
+          echo "${{ steps.ref.outputs.version }}" > "$OUT/VERSION"
+          cp scripts/install-pinch-fix.sh "$OUT/install.sh"
+          chmod +x "$OUT/install.sh"
+          zip -qr "pinch-zoom-fix-${{ steps.ref.outputs.version }}.zip" "$OUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pinch-zoom-fix-${{ steps.ref.outputs.version }}
+          path: pinch-zoom-fix-${{ steps.ref.outputs.version }}.zip
