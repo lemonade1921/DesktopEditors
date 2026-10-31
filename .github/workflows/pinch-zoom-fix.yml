@@ -79,25 +79,30 @@ jobs:
         run: |
           for ed in documenteditor spreadsheeteditor presentationeditor pdfeditor visioeditor; do
             echo "::group::$ed"
-            npx grunt "init-build-$ed" deploy-app-main 2>&1 | tee "../../grunt-$ed.log"
-            echo "::notice title=grunt $ed::$(grep -E 'Running|Done|Warning|Error|error' "../../grunt-$ed.log" | tail -25 | sed 's/\x1b\[[0-9;]*m//g' | tr '\n' '|')"
+            npx grunt "init-build-$ed" deploy-app-main
             echo "::endgroup::"
           done
 
       - name: Package
         run: |
           OUT=pinch-zoom-fix
-          mkdir -p "$OUT/web-apps/apps"
+          D=web-apps/deploy/web-apps
+          # The editors load these modules individually at runtime, so only the
+          # changed files need replacing: each editor's DocumentHolder controller
+          # (as built) and the shared utils (deployed as a plain copy).
+          FILES="apps/common/main/lib/util/utils.js"
           for ed in documenteditor spreadsheeteditor presentationeditor pdfeditor visioeditor; do
-            cp -R "web-apps/deploy/web-apps/apps/$ed" "$OUT/web-apps/apps/$ed"
-            HITS=$(grep -rl "SmoothWheelZoom" "$OUT/web-apps/apps/$ed/main" --include=*.js | sed "s|$OUT/web-apps/apps/||" | tr '\n' ' ')
-            if [ -z "$HITS" ]; then
-              echo "::error::fix missing from $ed bundle; files: $(cd $OUT/web-apps/apps/$ed/main && ls | tr '\n' ' ')"; exit 1
-            fi
-            echo "::notice::$ed fix found in: $HITS"
-            M="$OUT/web-apps/apps/$ed/main"
-            echo "::notice title=$ed main::$(cd $M && ls -la | awk '{print $5, $9}' | tr '\n' ' ') | handleDocumentWheel in: $(grep -rl handleDocumentWheel $M --include=*.js | sed "s|$M/||" | tr '\n' ' ') | isMac&&deltaMode: $(grep -rlE 'deltaMode' $M --include=*.js | sed "s|$M/||" | tr '\n' ' ')"
+            FILES="$FILES apps/$ed/main/app/controller/DocumentHolder.js"
           done
+          mkdir -p "$OUT/web-apps"
+          for f in $FILES; do
+            if [ -f "$D/$f" ]; then src="$D/$f"; else src="web-apps/$f"; fi
+            mkdir -p "$OUT/web-apps/$(dirname "$f")"
+            cp "$src" "$OUT/web-apps/$f"
+            grep -q "SmoothWheelZoom" "$OUT/web-apps/$f" || { echo "::error::fix missing from $f"; exit 1; }
+          done
+          (cd "$OUT/web-apps" && find . -type f | sort) > "$OUT/FILES"
+          echo "::notice title=packaged::$(tr '\n' ' ' < "$OUT/FILES")"
           echo "${{ steps.ref.outputs.version }}" > "$OUT/VERSION"
           cp scripts/install-pinch-fix.sh "$OUT/install.sh"
           chmod +x "$OUT/install.sh"
