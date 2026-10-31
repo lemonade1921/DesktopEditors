@@ -71,6 +71,7 @@ jobs:
         run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
 
       - name: Build editors
+        shell: bash
         working-directory: web-apps/build
         env:
           PRODUCT_VERSION: ${{ steps.ref.outputs.version }}
@@ -78,7 +79,8 @@ jobs:
         run: |
           for ed in documenteditor spreadsheeteditor presentationeditor pdfeditor visioeditor; do
             echo "::group::$ed"
-            npx grunt "init-build-$ed" deploy-app-main
+            npx grunt "init-build-$ed" deploy-app-main 2>&1 | tee "../../grunt-$ed.log"
+            echo "::notice title=grunt $ed::$(grep -E 'Running|Done|Warning|Error|error' "../../grunt-$ed.log" | tail -25 | sed 's/\x1b\[[0-9;]*m//g' | tr '\n' '|')"
             echo "::endgroup::"
           done
 
@@ -93,6 +95,8 @@ jobs:
               echo "::error::fix missing from $ed bundle; files: $(cd $OUT/web-apps/apps/$ed/main && ls | tr '\n' ' ')"; exit 1
             fi
             echo "::notice::$ed fix found in: $HITS"
+            M="$OUT/web-apps/apps/$ed/main"
+            echo "::notice title=$ed main::$(cd $M && ls -la | awk '{print $5, $9}' | tr '\n' ' ') | handleDocumentWheel in: $(grep -rl handleDocumentWheel $M --include=*.js | sed "s|$M/||" | tr '\n' ' ') | isMac&&deltaMode: $(grep -rlE 'deltaMode' $M --include=*.js | sed "s|$M/||" | tr '\n' ' ')"
           done
           echo "${{ steps.ref.outputs.version }}" > "$OUT/VERSION"
           cp scripts/install-pinch-fix.sh "$OUT/install.sh"
